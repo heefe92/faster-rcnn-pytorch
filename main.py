@@ -6,6 +6,7 @@ import pdb
 import collections
 import sys
 
+import numpy as np
 from torch.autograd import Variable
 from torch.utils import data as data_
 import model
@@ -38,6 +39,8 @@ test_dataloader = data_.DataLoader(testset,
 resnet = model.resnet50(20,True)
 resnet = resnet.cuda()
 resnet = torch.nn.DataParallel(resnet).cuda()
+resnet.load_state_dict(torch.load('resnet_6.pt'))
+
 
 optimizer = optim.Adam(resnet.parameters(), lr=opt.lr)
 scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=3, verbose=True)
@@ -50,25 +53,48 @@ resnet.module.freeze_bn()
 #resnet.freeze_bn()
 resnet.training = True
 
-epoch_loss = 0.0
-for epoch in range(opt.epoch):
-    start = time.time()
-    running_loss = 0.0
-    for iter_num, data in enumerate(dataloader):
-        optimizer.zero_grad()
-        losses = resnet([data[0].cuda().float(),data[1].cuda().float(),data[2].cuda().float(),data[3].cuda().float()])
-        losses[4].backward()
-        optimizer.step()
-
-        epoch_loss += losses[4].item()
-        running_loss += losses[4].item()
-        if iter_num % 500 == 499:  # print every 2000 mini-batches
-            print('[%d, %5d] loss: %.3f' %
-                  (epoch + 1, iter_num + 1, running_loss / 500))
-            running_loss = 0.0
 
 
-    print(time.time()-start)
-    print('[%d] loss %.3f:'%(epoch+1, epoch_loss/5000))
-    epoch_loss = 0.0
-    torch.save(resnet, 'filename_'+str(epoch)+'.pt')
+
+for iter_num, data in enumerate(test_dataloader):
+    losses = resnet([data[0].cuda().float(),data[1].cuda().float(),data[2].cuda().float(),data[3].cuda().float()])
+
+
+    curr_loss=losses[4].item()
+    loss_hist.append(float(curr_loss))
+
+
+    print('Epoch: {} | Iteration: {} | loss: {:1.5f} | Running loss: {:1.5f}'.format(
+            '1', iter_num, float(curr_loss), np.mean(loss_hist)))
+
+    del curr_loss
+
+
+#
+#
+# for epoch_num in range(opt.epoch):
+#     epoch_loss = []
+#     start = time.time()
+#
+#     for iter_num, data in enumerate(dataloader):
+#         optimizer.zero_grad()
+#         losses = resnet([data[0].cuda().float(),data[1].cuda().float(),data[2].cuda().float(),data[3].cuda().float()])
+#         losses[4].backward()
+#
+#         torch.nn.utils.clip_grad_norm_(resnet.parameters(), 0.1)
+#
+#         optimizer.step()
+#
+#         curr_loss=losses[4].item()
+#         loss_hist.append(float(curr_loss))
+#
+#         epoch_loss.append(float(curr_loss))
+#
+#         print('Epoch: {} | Iteration: {} | loss: {:1.5f} | Running loss: {:1.5f}'.format(
+#                 epoch_num, iter_num, float(curr_loss), np.mean(loss_hist)))
+#
+#         del curr_loss
+#
+#     scheduler.step(np.mean(epoch_loss))
+#     if(epoch_num%3==0):
+#         torch.save(resnet.state_dict(), 'resnet_{}.pt'.format(epoch_num))

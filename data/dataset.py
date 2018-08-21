@@ -24,7 +24,7 @@ def normalize(img):
 
 
 
-def preprocess(img, min_size, max_size):
+def preprocess(img, min_size=600, max_size=1000):
     """Preprocess an image for feature extraction.
 
     The length of the shorter edge is scaled to :obj:`self.min_size`.
@@ -99,11 +99,15 @@ class Dataset:
 class TestDataset:
     def __init__(self, opt, split='test', use_difficult=True):
         self.VOCBboxDataset = VOCBboxDataset(opt.voc_data_dir, split=split, use_difficult=use_difficult)
+        self.Transform = Transform(opt.min_size, opt.max_size)
 
     def __getitem__(self, idx):
         ori_img, bbox, label, difficult = self.VOCBboxDataset.get_example(idx)
-        img = preprocess(ori_img)
-        return img, ori_img.shape[1:], bbox, label, difficult
+
+        img, bbox, label, scale = self.Transform((ori_img, bbox, label))
+        # TODO: check whose stride is negative to fix this instead copy all
+        # some of the strides of a given numpy array are negative.
+        return img.copy(), bbox.copy(), label.copy(), scale
 
     def __len__(self):
         return len(self.VOCBboxDataset)

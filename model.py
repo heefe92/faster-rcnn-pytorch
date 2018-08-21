@@ -4,11 +4,13 @@ import six
 
 from torch.nn import functional as F
 from losses import FasterRCNNLoss
-
+from lib.nms import non_maximum_suppression
 from collections import namedtuple
 from string import Template
 import lib.array_tool as at
 from config import opt
+from data.dataset import preprocess
+from lib.bbox_tools import loc2bbox
 
 import torch as t
 from torch.autograd import Function
@@ -47,10 +49,11 @@ def GET_BLOCKS(N, K=CUDA_NUM_THREADS):
 class ResNet(nn.Module):
     feat_stride = 32  # downsample 32x for output of convolution resnet
     def __init__(self, num_classes, block, layers):
-        self.training=True
+        self.training=False
         self.inplanes = 64
         self.loc_normalize_mean = (0., 0., 0., 0.)
         self.loc_normalize_std = (0.1, 0.1, 0.2, 0.2)
+
 
         super(ResNet, self).__init__()
         self.conv1 = nn.Conv2d(3, 64, kernel_size=7, stride=2, padding=3, bias=False)
@@ -85,6 +88,14 @@ class ResNet(nn.Module):
         prior = 0.01
 
         self.freeze_bn()
+    def use_preset(self,isTraining):
+        if not isTraining:
+            self.nms_thresh = 0.3
+            self.score_thresh = 0.7
+        else:
+            self.nms_thresh = 0.3
+            self.score_thresh = 0.05
+        self.training=isTraining
 
     def _make_layer(self, block, planes, blocks, stride=1):
         downsample = None
@@ -107,7 +118,7 @@ class ResNet(nn.Module):
             if isinstance(layer, nn.BatchNorm2d):
                 layer.eval()
 
-    def forward(self, inputs):
+    def forward(self, inputs, scale=1.):
 
         if self.training:
             img_batch, bboxes, labels, scale = inputs
@@ -127,7 +138,7 @@ class ResNet(nn.Module):
         x4 = self.layer4(x3)
 
         features = self.fpn([x2, x3, x4])
-        rpn_locs, rpn_scores, rois, roi_indices, anchor = self.rpn(features,img_size)
+        rpn_locs, rpn_scores, rois, roi_indices, anchor = self.rpn(features,img_size,scale)
 
 
 
@@ -151,7 +162,7 @@ class ResNet(nn.Module):
             return self.Loss(gt_rpn_loc,gt_rpn_label, gt_roi_loc, gt_roi_label,roi_cls_loc, roi_score,rpn_locs, rpn_scores)
         else:
             roi_cls_loc, roi_score = self.roi_head(features, rois, roi_indices)
-            return roi_cls_loc,roi_score
+            return roi_cls_loc,roi_score, rois, roi_indices
         # regression = torch.cat([self.regressionModel(feature) for feature in features], dim=1)
         # classification = torch.cat([self.classificationModel(feature) for feature in features], dim=1)
         # anchors = self.anchors(img_batch)
@@ -171,6 +182,87 @@ class ResNet(nn.Module):
         #     anchors_nms_idx = nms(torch.cat([transformed_anchors, scores], dim=2)[0, :, :], 0.5)
         #     nms_scores, nms_class = classification[0, anchors_nms_idx, :].max(dim=1)
         #     return [nms_scores, nms_class, transformed_anchors[0, anchors_nms_idx, :]]
+    def _suppress(self, raw_cls_bbox, raw_prob):
+        bbox = list()
+        label = list()
+        score = list()
+        # skip cls_id = 0 because it is the background class
+        for l in range(1, self.n_class):
+            cls_bbox_l = raw_cls_bbox.reshape((-1, self.n_class, 4))[:, l, :]
+            prob_l = raw_prob[:, l]
+            mask = prob_l > self.score_thresh
+            cls_bbox_l = cls_bbox_l[mask]
+            prob_l = prob_l[mask]
+            keep = non_maximum_suppression(
+                cp.array(cls_bbox_l), self.nms_thresh, prob_l)
+            keep = cp.asnumpy(keep)
+            bbox.append(cls_bbox_l[keep])
+            # The labels are in [0, self.n_class - 2].
+            label.append((l - 1) * np.ones((len(keep),)))
+            score.append(prob_l[keep])
+        bbox = np.concatenate(bbox, axis=0).astype(np.float32)
+        label = np.concatenate(label, axis=0).astype(np.int32)
+        score = np.concatenate(score, axis=0).astype(np.float32)
+        return bbox, label, score
+    def predict(self,imgs,visualize):
+        self.use_preset(isTraining=False)
+        if visualize:
+            self.training=False
+            prepared_imgs = list()
+            sizes = list()
+            for img in imgs:
+                size = img.shape[1:]
+                img = preprocess(at.tonumpy(img))
+                prepared_imgs.append(img)
+                sizes.append(size)
+        else:
+             prepared_imgs = imgs
+        bboxes = list()
+        labels = list()
+        scores = list()
+        for img, size in zip(prepared_imgs, sizes):
+            img = t.autograd.Variable(at.totensor(img).float()[None], volatile=True)
+            scale = img.shape[3] / size[1]
+            roi_cls_loc, roi_scores, rois, _ = self(img, scale=scale)
+            # We are assuming that batch size is 1.
+            roi_score = roi_scores.data
+            roi_cls_loc = roi_cls_loc.data
+            roi = at.totensor(rois) / scale
+
+            # Convert predictions to bounding boxes in image coordinates.
+            # Bounding boxes are scaled to the scale of the input images.
+            self.n_class=21
+            mean = t.Tensor(self.loc_normalize_mean).cuda(). \
+                repeat(self.n_class)[None]
+            std = t.Tensor(self.loc_normalize_std).cuda(). \
+                repeat(self.n_class)[None]
+
+            roi_cls_loc = (roi_cls_loc * std + mean)
+            roi_cls_loc = roi_cls_loc.view(-1, self.n_class, 4)
+            roi = roi.view(-1, 1, 4).expand_as(roi_cls_loc)
+            cls_bbox = loc2bbox(at.tonumpy(roi).reshape((-1, 4)),
+                                at.tonumpy(roi_cls_loc).reshape((-1, 4)))
+            cls_bbox = at.totensor(cls_bbox)
+            cls_bbox = cls_bbox.view(-1, self.n_class * 4)
+            # clip bounding box
+            cls_bbox[:, 0::2] = (cls_bbox[:, 0::2]).clamp(min=0, max=size[0])
+            cls_bbox[:, 1::2] = (cls_bbox[:, 1::2]).clamp(min=0, max=size[1])
+
+            prob = at.tonumpy(F.softmax(at.tovariable(roi_score), dim=1))
+
+            raw_cls_bbox = at.tonumpy(cls_bbox)
+            raw_prob = at.tonumpy(prob)
+
+            bbox, label, score = self._suppress(raw_cls_bbox, raw_prob)
+            bboxes.append(bbox)
+            labels.append(label)
+            scores.append(score)
+
+        self.use_preset('evaluate')
+        self.train()
+        return bboxes, labels, scores
+
+
 class RegionProposalNetwork(nn.Module):
     """Region Proposal Network introduced in Faster R-CNN.
 

@@ -1,2 +1,8 @@
 
 *.pth
+
+*.pyc
+
+__pycache__/
+
+*.pt
